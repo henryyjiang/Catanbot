@@ -1,0 +1,5 @@
+# CatanBot — requirements for Google Colab
+# Colab already provides: torch, numpy, matplotlib, scipy
+# Only extras needed:
+
+tensorboard>=2.14

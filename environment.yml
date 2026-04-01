@@ -1,0 +1,34 @@
+name: catanbot
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # ── Python ──
+  - python=3.11
+
+  # ── Core ML ──
+  - pytorch::pytorch>=2.2
+  - pytorch::pytorch-cuda=12.4    # match your cluster's CUDA; change if needed
+  - numpy>=1.24
+
+  # ── Training infrastructure ──
+  - tensorboard>=2.14
+  - tqdm
+
+  # ── Evaluation & plotting ──
+  - matplotlib>=3.7
+  - scipy>=1.11
+
+  # ── Jupyter ──
+  - jupyterlab>=4.0
+  - ipywidgets>=8.0
+  - notebook>=7.0
+
+  # ── Utilities ──
+  - pip
+
+  - pip:
+    # anything not on conda-forge goes here
+    - tensorboardX  # fallback if torch.utils.tensorboard has issues

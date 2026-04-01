@@ -1,0 +1,10 @@
+.venv/
+games/
+trade_data/
+trade_models/
+_tmp_chunks/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+Thumbs.db
+.DS_Store
