@@ -7,4 +7,5 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 Thumbs.db
-.DS_Store
+.DS_Storetrade_data/
+games.tar.gz
