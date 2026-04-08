@@ -28,7 +28,7 @@ from data.encoder import StateEncoder
 from data.replay import GameReplay
 from data.enums import Resource, LogType
 
-from mcts.trade_encoder import Trade, TradeEncoder
+from trade_mcts.trade_encoder import Trade, TradeEncoder
 
 
 # ═══════════════════════════════════════════════

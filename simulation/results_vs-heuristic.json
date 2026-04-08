@@ -1,0 +1,35 @@
+{
+  "num_games": 100,
+  "checkpoint": "checkpoints/best.pt",
+  "iterations": 100,
+  "opponent_rounds": 1,
+  "seed": null,
+  "mode": "vs-heuristic",
+  "win_counts": {
+    "1": 19,
+    "2": 26,
+    "3": 27,
+    "4": 28
+  },
+  "win_rates": {
+    "1": 0.19,
+    "2": 0.26,
+    "3": 0.27,
+    "4": 0.28
+  },
+  "avg_final_vp": {
+    "1": 6.55,
+    "2": 7.46,
+    "3": 7.07,
+    "4": 7.03
+  },
+  "avg_resources_collected": {
+    "1": 137.16,
+    "2": 146.88,
+    "3": 142.89,
+    "4": 138.04
+  },
+  "avg_game_length": 192.08,
+  "avg_sevens_per_game": 32.06,
+  "elapsed_seconds": 9882.201691150665
+}
