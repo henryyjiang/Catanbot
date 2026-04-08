@@ -41,54 +41,59 @@ def extract_trade_events(game_data: dict) -> list[dict]:
 
     The Colonist event format has:
       - TRADE_OFFER (118): a player proposes a trade
-      - TRADE_ACCEPTED (116): a player accepts the current offer
-      - TRADE_COMPLETED (117): the trade is finalized
+      - TRADE_COMPLETED (117): the trade is finalized between specific players
+      - Direct trade (115): immediate trade between two players
 
-    We reconstruct the full context for each trade decision.
+    We track which players accepted by looking at who the trade completed with.
     """
     events = game_data['data']['eventHistory']['events']
     trade_events = []
-    pending_offer = None
 
     for i, event in enumerate(events):
-        # Event type is nested under stateChange.gameLogState.text.type
         sc = event.get('stateChange', {})
         game_log = sc.get('gameLogState', {})
-        text = game_log.get('text', {})
-        log_type = text.get('type')
+        
+        # game_log is a dict of log entries, each with a 'text' field
+        for log_entry in game_log.values():
+            text = log_entry.get('text', {})
+            log_type = text.get('type')
 
-        if log_type == LogType.TRADE_OFFER:
-            # New trade offer — extract details from text payload
-            pending_offer = {
-                'event_idx': i,
-                'proposer_color': text.get('playerColor'),
-                'offering': _parse_resource_dict(text.get('offering', {})),
-                'requesting': _parse_resource_dict(text.get('requesting', {})),
-                'responses': {},  # will be filled by accept/reject events
-            }
+            if log_type == LogType.TRADE_COMPLETED:
+                # Trade completed between specific players
+                proposer_color = text.get('playerColorCreator')
+                responder_color = text.get('playerColorOffered')
+                offered = text.get('offeredCardEnums', [])
+                wanted = text.get('wantedCardEnums', [])
+                
+                if proposer_color is not None and responder_color is not None and offered and wanted:
+                    trade_events.append({
+                        'event_idx': i,
+                        'proposer_color': proposer_color,
+                        'responder_color': responder_color,
+                        'offering': {r: offered.count(r) for r in set(offered)},
+                        'requesting': {r: wanted.count(r) for r in set(wanted)},
+                        'responses': {responder_color: True},  # This responder accepted
+                        'completed': True,
+                        'completion_event_idx': i,
+                    })
 
-        elif log_type == LogType.TRADE_ACCEPTED and pending_offer:
-            responder = text.get('playerColor')
-            if responder is not None:
-                pending_offer['responses'][responder] = True
-
-        elif log_type == LogType.TRADE_COMPLETED and pending_offer:
-            # Trade went through — record it
-            trade_events.append({
-                **pending_offer,
-                'completed': True,
-                'completion_event_idx': i,
-            })
-            pending_offer = None
-
-        elif log_type == LogType.TURN_END and pending_offer:
-            # Turn ended without completion — offer expired/rejected
-            trade_events.append({
-                **pending_offer,
-                'completed': False,
-                'completion_event_idx': i,
-            })
-            pending_offer = None
+            elif log_type == 115:  # Direct trade acceptance (type 115)
+                proposer_color = text.get('playerColor')
+                responder_color = text.get('acceptingPlayerColor')
+                offered = text.get('givenCardEnums', [])
+                wanted = text.get('receivedCardEnums', [])
+                
+                if proposer_color is not None and responder_color is not None and offered and wanted:
+                    trade_events.append({
+                        'event_idx': i,
+                        'proposer_color': proposer_color,
+                        'responder_color': responder_color,
+                        'offering': {r: offered.count(r) for r in set(offered)},
+                        'requesting': {r: wanted.count(r) for r in set(wanted)},
+                        'responses': {responder_color: True},  # This responder accepted
+                        'completed': True,
+                        'completion_event_idx': i,
+                    })
 
     return trade_events
 
@@ -113,10 +118,10 @@ def generate_acceptance_samples(
     """
     Generate (features, accepted) samples for the acceptance model.
 
-    For each trade offer in the game:
-    - Replay to the state just before the offer
-    - For each opponent of the proposer, generate a sample:
-        - label = 1 if they accepted, 0 otherwise
+    For each trade that was completed or rejected:
+    - Replay to the state just before the trade
+    - For each opponent of the proposer:
+        - label = 1 if they accepted, 0 if they rejected or didn't respond
     - Encode with TradeEncoder from the responder's perspective
     """
     encoder = encoder or TradeEncoder()
@@ -137,9 +142,13 @@ def generate_acceptance_samples(
             continue
 
         # Replay to the state just before this trade offer
-        state = replay.replay_to_event(te['event_idx'])
+        try:
+            state = replay.replay_to_event(te['event_idx'])
+        except Exception:
+            continue
 
         proposer_color = te['proposer_color']
+        responder_color = te.get('responder_color')
 
         # For each non-proposer player, generate an acceptance sample
         for color in state.player_colors:
@@ -153,12 +162,17 @@ def generate_acceptance_samples(
                 requesting=te['requesting'],
             )
 
-            features = encoder.encode_for_acceptance(state, trade, color)
-            accepted = te['responses'].get(color, False)
+            try:
+                features = encoder.encode_for_acceptance(state, trade, color)
+            except Exception:
+                continue
+
+            # Label: 1 if this player accepted, 0 otherwise
+            accepted = 1.0 if color == responder_color else 0.0
 
             yield {
                 'features': features,
-                'accepted': float(accepted),
+                'accepted': accepted,
                 'proposer_color': proposer_color,
                 'responder_color': color,
                 'trade_completed': te['completed'],

@@ -1,7 +1,5 @@
 .venv/
 games/
-trade_data/
-trade_models/
 _tmp_chunks/
 __pycache__/
 *.pyc
@@ -9,3 +7,5 @@ __pycache__/
 Thumbs.db
 .DS_Storetrade_data/
 games.tar.gz
+dataset/
+training_data/
