@@ -22,16 +22,16 @@ from data.replay import GameReplay
 from data.scoring import compute_label
 from data.enums import Resource, LogType
 
-from mcts.hand_tracker import HandTracker, HandBelief
-from mcts.trade_encoder import Trade, TradeEncoder, generate_candidate_trades
-from mcts.trade_models import (
+from trade_mcts.hand_tracker import HandTracker, HandBelief
+from trade_mcts.trade_encoder import Trade, TradeEncoder, generate_candidate_trades
+from trade_mcts.trade_models import (
     TradeAcceptanceModel, TradeProposalPolicy,
     generate_acceptance_samples, generate_proposal_samples,
     extract_trade_events,
     train_acceptance_model, train_proposal_policy,
     TradeDataset,
 )
-from mcts.search import TradeMCTS, find_best_trade
+from trade_mcts.search import TradeMCTS, find_best_trade
 
 
 # ═══════════════════════════════════════════════
