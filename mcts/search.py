@@ -1,49 +1,31 @@
 """
-MCTS search engine for Catan main-phase decisions.
+Monte Carlo Tree Search for Catan trading decisions.
 
-Architecture
-------------
-Value-MCTS with opponent simulation.  The tree is always one-ply for OUR
-decisions (root → our action → child state).  The evaluation at each leaf is
-deepened by running `opponent_rounds` rounds of greedy opponent play using the
-fast heuristic evaluator, then scoring the resulting state with CatanNet.
+Tree structure at a trade decision point:
 
-Why this design:
-  - Our decisions are what we control → put them in the tree so MCTS can
-    allocate budget to promising branches.
-  - Opponent decisions are uncertain → simulate them greedily with a fast
-    heuristic rather than branching the tree (which would explode exponentially).
-  - After opponent simulation the leaf state reflects one full round of
-    responses, so CatanNet sees a position where the resources we gained (e.g.
-    from Monopoly) have already been partially spent by us or contested by
-    opponents.  This fixes the systematic undervaluation of card-gaining actions
-    that occurs with one-ply evaluation.
+    [DECISION] Choose trade (or no-trade) from candidate set
+         │
+         ├── Trade A → [CHANCE] Opponent accepts? (from acceptance model)
+         │      ├── Accept  → [EVAL] Score resulting state
+         │      └── Reject  → [EVAL] Score state without trade
+         │
+         ├── Trade B → [CHANCE] Opponent accepts?
+         │      ├── Accept  → [EVAL]
+         │      └── Reject  → [EVAL]
+         │
+         ├── ...
+         │
+         └── No Trade → [EVAL] Score current state
 
-Parameters that matter most
----------------------------
-  iterations     Higher → stabler visit counts → more confident best action.
-                 800 is a good default; use 1500+ for tournament-quality play.
-  opponent_rounds  1 = simulate one full round of all opponents after our
-                 action (recommended).  0 = original one-ply (fast but biased).
-  exploration_constant  C in PUCT.  1.4 works well; lower → more greedy.
+The value at leaf nodes comes from your existing win-prediction / scoring
+system (data.scoring.compute_label or a trained neural evaluator).
 
-For multi-action turns, call find_best_action() in a loop until PassTurn is
-returned. The caller tracks dev_card_played_this_turn across calls.
-
-Usage
------
-    from mcts import find_best_action, StateEvaluator, apply_action
-    from mcts.actions import PassTurn, PlayKnight, PlayMonopoly
-
-    ev = StateEvaluator("checkpoints/best.pt")
-    dev_played = False
-    while True:
-        action = find_best_action(state, my_color, ev, verbose=True)
-        if isinstance(action, PassTurn):
-            break
-        state = apply_action(state, action, my_color)
-        if isinstance(action, (PlayKnight, PlayMonopoly)):
-            dev_played = True
+Key design decisions:
+  - Partial observation: opponent hands sampled from HandTracker particles
+  - Trade actions pruned by TradeProposalPolicy (top-K)
+  - Acceptance probability from TradeAcceptanceModel (chance node)
+  - UCB1 for tree policy with tunable exploration constant
+  - Leaf evaluation uses your composite scoring function
 """
 
 from __future__ import annotations
@@ -51,418 +33,496 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Optional
-
 import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional, Callable
 
 from data.state import CatanState
-from mcts.actions import Action, PassTurn
-from mcts.evaluator import StateEvaluator
-from mcts.move_generator import get_legal_actions
-from mcts.state_transition import apply_action
+from data.scoring import compute_label
+from data.encoder import StateEncoder
+
+from mcts.hand_tracker import HandTracker
+from mcts.trade_encoder import Trade, TradeEncoder, generate_candidate_trades
+from mcts.trade_models import TradeAcceptanceModel, TradeProposalPolicy
 
 
-# How many candidate actions we evaluate per opponent when simulating their
-# turn.  Capped to keep opponent simulation cheap (heuristic is fast but
-# enumerating 20+ actions × 3 opponents × 800 iterations still adds up).
-_MAX_OPP_CANDIDATES = 8
-
-
-# ─── Tree node ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# Tree nodes
+# ═══════════════════════════════════════════════
 
 @dataclass
 class MCTSNode:
-    """One node in the search tree (always a direct child of root)."""
+    """A node in the MCTS tree."""
+    # What action led to this node
+    action: Optional[Trade]  # None = no-trade or root
+    action_type: str = 'root'  # 'root', 'trade', 'no_trade', 'accept', 'reject'
 
-    state: CatanState          # state AFTER applying this node's action
-    action: Optional[Action]   # action that produced this state; None at root
-    parent: Optional["MCTSNode"]
-    prior: float = 1.0         # PUCT prior — uniform unless a policy net is used
-
+    # Statistics
     visit_count: int = 0
     total_value: float = 0.0
-    children: list["MCTSNode"] = field(default_factory=list)
+
+    # Tree structure
+    parent: Optional['MCTSNode'] = None
+    children: list['MCTSNode'] = field(default_factory=list)
+
+    # For chance nodes
+    probability: float = 1.0  # P(this outcome) for chance nodes
+
+    # Prior from proposal policy (used in PUCT)
+    prior: float = 0.0
 
     @property
     def q_value(self) -> float:
-        return self.total_value / self.visit_count if self.visit_count else 0.0
+        """Average value of this node."""
+        if self.visit_count == 0:
+            return 0.0
+        return self.total_value / self.visit_count
 
     @property
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
+    @property
+    def is_chance(self) -> bool:
+        return self.action_type in ('accept', 'reject')
 
-# ─── MCTS engine ──────────────────────────────────────────────────────────────
 
-class CatanMCTS:
+# ═══════════════════════════════════════════════
+# MCTS Engine
+# ═══════════════════════════════════════════════
+
+class TradeMCTS:
     """
-    Monte Carlo Tree Search for Catan main-phase decisions.
+    MCTS engine for Catan trade decisions.
 
-    Parameters
-    ----------
-    state : CatanState
-        Current game state (after dice roll, before any main-phase action).
-    color : int
-        Player colour we are optimising for.
-    evaluator : StateEvaluator
-        Wraps CatanNet (or heuristic) — used for final leaf evaluation.
-    exploration_constant : float
-        C in PUCT.  1.4 is a good starting value.
-    opponent_rounds : int
-        How many rounds of greedy opponent play to simulate after our action
-        before calling the evaluator.  0 = one-ply (fast, slightly biased).
-        1 = one full round of opponents (recommended default).
-    dev_card_played_this_turn : bool
-        True if a dev card has already been played this turn.
-    dirichlet_alpha : float
-        Concentration of Dirichlet noise added to root priors.  0 = off.
-    dirichlet_weight : float
-        Fraction of root prior replaced by noise (AlphaZero uses 0.25).
+    Usage:
+        mcts = TradeMCTS(
+            state=current_game_state,
+            perspective_color=my_color,
+            hand_tracker=my_tracker,
+            acceptance_model=acceptance_model,
+            proposal_policy=proposal_policy,
+        )
+        best_trade = mcts.search(iterations=1000)
     """
 
     def __init__(
         self,
         state: CatanState,
-        color: int,
-        evaluator: StateEvaluator,
+        perspective_color: int,
+        hand_tracker: HandTracker,
+        acceptance_model: Optional[TradeAcceptanceModel] = None,
+        proposal_policy: Optional[TradeProposalPolicy] = None,
+        value_fn: Optional[Callable[[CatanState, int], float]] = None,
         exploration_constant: float = 1.4,
-        opponent_rounds: int = 1,
-        dev_card_played_this_turn: bool = False,
-        dirichlet_alpha: float = 0.3,
-        dirichlet_weight: float = 0.25,
+        max_candidates: int = 15,
     ):
-        self.color = color
-        self.evaluator = evaluator
+        self.state = state
+        self.perspective_color = perspective_color
+        self.hand_tracker = hand_tracker
+        self.acceptance_model = acceptance_model
+        self.proposal_policy = proposal_policy
         self.exploration_constant = exploration_constant
-        self.opponent_rounds = opponent_rounds
-        self.dev_card_played_this_turn = dev_card_played_this_turn
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_weight = dirichlet_weight
+        self.max_candidates = max_candidates
 
-        self.root = MCTSNode(state=state, action=None, parent=None, prior=1.0)
+        # Value function — defaults to scoring.compute_label
+        self.value_fn = value_fn or self._default_value_fn
 
-    # ─── Public API ──────────────────────────────────────────────────────────
+        # Encoders
+        self.trade_encoder = TradeEncoder()
+        self.state_encoder = StateEncoder()
+
+        # Root node
+        self.root = MCTSNode(action=None, action_type='root')
+
+        # Generate and score candidate trades
+        self.candidates = self._generate_scored_candidates()
+
+    def _default_value_fn(self, state: CatanState, color: int) -> float:
+        """
+        Default leaf evaluation using the existing scoring system.
+        Uses only the components that don't need future knowledge.
+        """
+        from data.scoring import relative_position_score, economic_quality_score
+
+        s_pos = relative_position_score(state, color)
+        s_eco = economic_quality_score(state, color)
+
+        # Weight toward position in mid/late game, economic early
+        progress = min(state.current_turn / 80.0, 1.0)
+        w_pos = 0.4 + 0.2 * progress
+        w_eco = 0.6 - 0.2 * progress
+
+        return w_pos * s_pos + w_eco * s_eco
+
+    def _generate_scored_candidates(self) -> list[tuple[Optional[Trade], float]]:
+        """Generate candidate trades and score them with the proposal policy."""
+        raw_candidates = generate_candidate_trades(
+            self.state,
+            self.perspective_color,
+            max_candidates=self.max_candidates * 3,  # generate more, then prune
+        )
+
+        if self.proposal_policy is None:
+            # No policy — use all candidates with uniform priors
+            return [(t, 1.0 / len(raw_candidates)) for t in raw_candidates]
+
+        # Score each candidate
+        scored = []
+        features_list = []
+        for trade in raw_candidates:
+            feat = self.trade_encoder.encode_for_proposal(
+                self.state, trade, self.perspective_color
+            )
+            features_list.append(feat)
+
+        scores = self.proposal_policy.score_trades(features_list)
+
+        # Softmax to get priors
+        scores_arr = np.array(scores)
+        scores_arr = scores_arr - scores_arr.max()  # numerical stability
+        exp_scores = np.exp(scores_arr)
+        priors = exp_scores / exp_scores.sum()
+
+        scored = list(zip(raw_candidates, priors.tolist()))
+
+        # Keep top-K by prior
+        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = scored[:self.max_candidates]
+
+        # Renormalize priors
+        total = sum(p for _, p in scored)
+        scored = [(t, p / total) for t, p in scored]
+
+        return scored
+
+    # ─── Core MCTS loop ───
 
     def search(
         self,
-        iterations: int = 800,
+        iterations: int = 1000,
         time_limit: Optional[float] = None,
-    ) -> Action:
+    ) -> Optional[Trade]:
         """
-        Run MCTS for `iterations` iterations (or `time_limit` seconds).
-        Returns the recommended Action.
+        Run MCTS and return the best trade action.
+        Returns None if "no trade" is the best action.
         """
-        self._expand_root()
-        if not self.root.children:
-            return PassTurn()
+        start_time = time.time()
 
-        if self.dirichlet_alpha > 0 and len(self.root.children) > 1:
-            self._add_dirichlet_noise(self.root)
-
-        start = time.time()
-        for _ in range(iterations):
-            if time_limit and (time.time() - start) > time_limit:
+        for i in range(iterations):
+            if time_limit and (time.time() - start_time) > time_limit:
                 break
+
+            # 1. Selection — walk tree using UCB/PUCT
             node = self._select(self.root)
+
+            # 2. Expansion — add children if this is a leaf
+            if node.visit_count > 0 and node.is_leaf:
+                self._expand(node)
+                # Pick a child to evaluate
+                if node.children:
+                    node = self._pick_child_for_rollout(node)
+
+            # 3. Evaluation — score the leaf state
             value = self._evaluate(node)
+
+            # 4. Backpropagation
             self._backpropagate(node, value)
 
+        # Pick the most-visited child of root (robust child selection)
         return self._best_action()
 
-    def get_action_stats(self) -> list[dict]:
-        """Per-action statistics for root's children, sorted by visit count."""
-        stats = [
-            {
-                "action": str(c.action),
-                "visits": c.visit_count,
-                "q_value": round(c.q_value, 4),
-                "prior": round(c.prior, 4),
-            }
-            for c in self.root.children
-        ]
-        stats.sort(key=lambda x: x["visits"], reverse=True)
-        return stats
-
-    def print_analysis(self, top_n: int = 10) -> None:
-        stats = self.get_action_stats()[:top_n]
-        total = max(sum(s["visits"] for s in stats), 1)
-        print(f"\n{'='*62}")
-        print(f"MCTS — Player {self.color} | "
-              f"{self.root.visit_count} iters | "
-              f"{len(self.root.children)} candidates | "
-              f"opp_rounds={self.opponent_rounds}")
-        print(f"{'='*62}")
-        for i, s in enumerate(stats):
-            pct = s["visits"] / total * 100
-            print(f"  #{i+1:2d} [{s['visits']:4d} visits, {pct:4.1f}%] "
-                  f"Q={s['q_value']:.4f}  {s['action']}")
-        print(f"{'='*62}")
-        if stats:
-            print(f"  BEST: {stats[0]['action']}")
-        print(f"{'='*62}\n")
-
-    # ─── Opponent simulation ─────────────────────────────────────────────────
-
-    def _simulate_opponents(self, state: CatanState, rounds: int) -> CatanState:
-        """
-        Simulate `rounds` rounds of opponent play using a fast greedy heuristic.
-
-        Each opponent evaluates up to _MAX_OPP_CANDIDATES non-pass actions
-        using evaluate_fast() (heuristic only — no GPU calls) and takes
-        whichever improves their position most.  If no action helps, they pass.
-
-        Dice rolls are not simulated — we assume resource production averages
-        out across MCTS iterations and the evaluator captures production rate
-        through the economic score.
-
-        Stochastic actions (knight steal, monopoly) introduce realistic
-        variance across iterations, which is desirable.
-        """
-        for _ in range(rounds):
-            for opp_color in state.player_colors:
-                if opp_color == self.color:
-                    continue
-
-                opp_actions = get_legal_actions(state, opp_color)
-                # Score the current state as the baseline (passing)
-                baseline = self.evaluator.evaluate_fast(state, opp_color)
-                best_score = baseline
-                best_action: Action = PassTurn()
-
-                # Evaluate non-pass candidates (capped for speed)
-                candidates = [a for a in opp_actions if not isinstance(a, PassTurn)]
-                random.shuffle(candidates)  # avoid systematic bias from ordering
-                for action in candidates[:_MAX_OPP_CANDIDATES]:
-                    try:
-                        next_state = apply_action(state, action, opp_color)
-                        score = self.evaluator.evaluate_fast(next_state, opp_color)
-                        if score > best_score:
-                            best_score = score
-                            best_action = action
-                    except Exception:
-                        continue
-
-                state = apply_action(state, best_action, opp_color)
-
-        return state
-
-    # ─── Internal MCTS methods ───────────────────────────────────────────────
-
-    def _expand_root(self) -> None:
-        """Populate root's children — one per legal action for our color."""
-        actions = get_legal_actions(
-            self.root.state,
-            self.color,
-            dev_card_played_this_turn=self.dev_card_played_this_turn,
-        )
-        if not actions:
-            return
-        prior = 1.0 / len(actions)
-        for action in actions:
-            child_state = apply_action(self.root.state, action, self.color)
-            self.root.children.append(MCTSNode(
-                state=child_state,
-                action=action,
-                parent=self.root,
-                prior=prior,
-            ))
-
-    def _add_dirichlet_noise(self, node: MCTSNode) -> None:
-        n = len(node.children)
-        noise = np.random.dirichlet([self.dirichlet_alpha] * n)
-        w = self.dirichlet_weight
-        for child, eta in zip(node.children, noise):
-            child.prior = (1 - w) * child.prior + w * float(eta)
-
     def _select(self, node: MCTSNode) -> MCTSNode:
-        """Select a child using PUCT, preferring unvisited nodes first."""
+        """Walk tree by UCB1/PUCT until reaching a leaf or unexpanded node."""
+        while not node.is_leaf:
+            if any(c.visit_count == 0 for c in node.children):
+                # Expand unvisited children first
+                unvisited = [c for c in node.children if c.visit_count == 0]
+                return random.choice(unvisited)
+            node = self._best_ucb_child(node)
+        return node
+
+    def _best_ucb_child(self, node: MCTSNode) -> MCTSNode:
+        """Select child with highest UCB1/PUCT score."""
+        best_score = -float('inf')
+        best_child = node.children[0]
+        log_parent = math.log(node.visit_count + 1)
+
+        for child in node.children:
+            if child.visit_count == 0:
+                return child
+
+            # PUCT formula (used by AlphaGo/AlphaZero)
+            exploitation = child.q_value
+            exploration = self.exploration_constant * child.prior * (
+                math.sqrt(log_parent) / (1 + child.visit_count)
+            )
+
+            # For chance nodes, weight by probability
+            score = exploitation + exploration
+            if child.is_chance:
+                score *= child.probability
+
+            if score > best_score:
+                best_score = score
+                best_child = child
+
+        return best_child
+
+    def _expand(self, node: MCTSNode):
+        """Expand a leaf node by adding children."""
+        if node.action_type == 'root':
+            # Root → trade decision nodes
+            for trade, prior in self.candidates:
+                action_type = 'no_trade' if trade is None else 'trade'
+                child = MCTSNode(
+                    action=trade,
+                    action_type=action_type,
+                    parent=node,
+                    prior=prior,
+                )
+                node.children.append(child)
+
+        elif node.action_type == 'trade':
+            # Trade decision → chance nodes (accept / reject)
+            trade = node.action
+            accept_prob = self._get_acceptance_probability(trade)
+
+            accept_node = MCTSNode(
+                action=trade,
+                action_type='accept',
+                parent=node,
+                probability=accept_prob,
+                prior=accept_prob,
+            )
+            reject_node = MCTSNode(
+                action=trade,
+                action_type='reject',
+                parent=node,
+                probability=1.0 - accept_prob,
+                prior=1.0 - accept_prob,
+            )
+            node.children = [accept_node, reject_node]
+
+        # no_trade and chance nodes are leaf-evaluated, not expanded further
+
+    def _pick_child_for_rollout(self, node: MCTSNode) -> MCTSNode:
+        """For chance nodes, sample according to probability.
+        For decision nodes, pick unvisited or best UCB."""
+        # If this is a trade node with accept/reject children, sample by probability
+        if node.action_type == 'trade' and node.children:
+            r = random.random()
+            cumulative = 0.0
+            for child in node.children:
+                cumulative += child.probability
+                if r < cumulative:
+                    return child
+            return node.children[-1]
+
+        # Otherwise pick unvisited or random
         unvisited = [c for c in node.children if c.visit_count == 0]
         if unvisited:
             return random.choice(unvisited)
-        return self._best_puct_child(node)
-
-    def _best_puct_child(self, node: MCTSNode) -> MCTSNode:
-        c = self.exploration_constant
-        sqrt_parent = math.sqrt(node.visit_count)
-        best_score = -float("inf")
-        best_child = node.children[0]
-        for child in node.children:
-            puct = child.q_value + c * child.prior * sqrt_parent / (1 + child.visit_count)
-            if puct > best_score:
-                best_score = puct
-                best_child = child
-        return best_child
+        return random.choice(node.children)
 
     def _evaluate(self, node: MCTSNode) -> float:
         """
-        Evaluate a leaf node.
+        Evaluate a leaf node by simulating the trade result.
 
-        If opponent_rounds > 0, first simulate that many rounds of opponent
-        greedy play, then score the resulting state with the full evaluator
-        (neural network if loaded).  This makes the value estimate reflect
-        what the position looks like after opponents have responded to our move,
-        rather than scoring the state immediately after our action alone.
+        For 'no_trade' or 'reject': evaluate current state as-is.
+        For 'accept': apply the trade to a copy of the state, then evaluate.
         """
-        if self.opponent_rounds > 0:
-            sim_state = self._simulate_opponents(node.state, self.opponent_rounds)
-            return self.evaluator.evaluate(sim_state, self.color)
-        return self.evaluator.evaluate(node.state, self.color)
+        # Sample hands from belief state for this evaluation
+        sampled_hands = self.hand_tracker.sample_all_hands()
 
-    def _backpropagate(self, node: MCTSNode, value: float) -> None:
-        current: Optional[MCTSNode] = node
+        if node.action_type in ('no_trade', 'reject', 'root'):
+            # Evaluate the current state
+            eval_state = self.state.copy()
+            # Inject sampled hands for opponents
+            for color, hand in sampled_hands.items():
+                if color != self.perspective_color:
+                    cards = []
+                    for res, count in hand.items():
+                        cards.extend([res] * count)
+                    eval_state.players[color].resource_cards = cards
+            return self.value_fn(eval_state, self.perspective_color)
+
+        elif node.action_type == 'accept':
+            # Apply the trade and evaluate
+            trade = node.action
+            eval_state = self.state.copy()
+
+            # Inject sampled hands
+            for color, hand in sampled_hands.items():
+                if color != self.perspective_color:
+                    cards = []
+                    for res, count in hand.items():
+                        cards.extend([res] * count)
+                    eval_state.players[color].resource_cards = cards
+
+            # Apply trade
+            proposer = eval_state.players.get(trade.proposer_color)
+            responder = eval_state.players.get(trade.responder_color)
+
+            if proposer and responder:
+                # Remove offered resources from proposer, add to responder
+                for res, amt in trade.offering.items():
+                    for _ in range(amt):
+                        if res in proposer.resource_cards:
+                            proposer.resource_cards.remove(res)
+                        responder.resource_cards.append(res)
+
+                # Remove requested resources from responder, add to proposer
+                for res, amt in trade.requesting.items():
+                    for _ in range(amt):
+                        if res in responder.resource_cards:
+                            responder.resource_cards.remove(res)
+                        proposer.resource_cards.append(res)
+
+            return self.value_fn(eval_state, self.perspective_color)
+
+        return 0.5  # fallback
+
+    def _get_acceptance_probability(self, trade: Trade) -> float:
+        """Get P(accept) from the acceptance model, or use a heuristic."""
+        if self.acceptance_model is None:
+            # Heuristic fallback: 50/50 baseline, penalize if proposer is leading
+            proposer = self.state.players.get(trade.proposer_color)
+            responder = self.state.players.get(trade.responder_color)
+            if proposer and responder:
+                vp_gap = proposer.total_vp - responder.total_vp
+                # Less likely to trade with the leader
+                base_prob = 0.3
+                if vp_gap > 0:
+                    base_prob -= vp_gap * 0.05
+                elif vp_gap < 0:
+                    base_prob += abs(vp_gap) * 0.03
+                return max(0.05, min(0.8, base_prob))
+            return 0.3
+
+        # Use the trained model
+        responder_color = trade.responder_color
+        if responder_color is None:
+            return 0.3
+
+        features = self.trade_encoder.encode_for_acceptance(
+            self.state, trade, responder_color
+        )
+        return self.acceptance_model.predict(features)
+
+    def _backpropagate(self, node: MCTSNode, value: float):
+        """Propagate value up the tree."""
+        current = node
         while current is not None:
             current.visit_count += 1
             current.total_value += value
             current = current.parent
 
-    def _best_action(self) -> Action:
-        """Robust child: most visits, Q-value as tiebreaker."""
+    def _best_action(self) -> Optional[Trade]:
+        """Return the best trade based on visit count (robust child)."""
         if not self.root.children:
-            return PassTurn()
-        return max(self.root.children, key=lambda c: (c.visit_count, c.q_value)).action
+            return None
+
+        # Most-visited child
+        best = max(self.root.children, key=lambda c: c.visit_count)
+        return best.action
+
+    # ─── Diagnostics ───
+
+    def get_action_stats(self) -> list[dict]:
+        """Return statistics for each candidate action at the root."""
+        stats = []
+        for child in self.root.children:
+            trade = child.action
+            stats.append({
+                'trade': str(trade) if trade else 'No Trade',
+                'visits': child.visit_count,
+                'q_value': child.q_value,
+                'prior': child.prior,
+                'action_type': child.action_type,
+            })
+        stats.sort(key=lambda x: x['visits'], reverse=True)
+        return stats
+
+    def print_analysis(self, top_n: int = 10):
+        """Print a human-readable analysis of the search results."""
+        stats = self.get_action_stats()[:top_n]
+
+        total_visits = sum(s['visits'] for s in stats)
+        print(f"\n{'='*60}")
+        print(f"MCTS Trade Analysis — Player {self.perspective_color}")
+        print(f"Total iterations: {self.root.visit_count}")
+        print(f"Candidates explored: {len(self.root.children)}")
+        print(f"{'='*60}")
+
+        for i, s in enumerate(stats):
+            visit_pct = (s['visits'] / max(total_visits, 1)) * 100
+            print(f"\n  #{i+1}: {s['trade']}")
+            print(f"      Visits: {s['visits']} ({visit_pct:.1f}%) | "
+                  f"Q: {s['q_value']:.4f} | Prior: {s['prior']:.4f}")
+
+            # If it's a trade node, show accept/reject stats
+            node = [c for c in self.root.children
+                    if str(c.action) == (str(s['trade']) if s['trade'] != 'No Trade' else str(None))
+                    and c.action_type == s['action_type']]
+            if node and node[0].children:
+                for cc in node[0].children:
+                    print(f"        {cc.action_type}: "
+                          f"visits={cc.visit_count}, "
+                          f"P={cc.probability:.3f}, "
+                          f"Q={cc.q_value:.4f}")
+
+        print(f"\n{'='*60}")
+        best = stats[0] if stats else None
+        if best:
+            if best['trade'] == 'No Trade':
+                print(f"RECOMMENDATION: Don't trade this turn")
+            else:
+                print(f"RECOMMENDATION: {best['trade']}")
+        print(f"{'='*60}\n")
 
 
-# ─── Convenience function ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+# Convenience function
+# ═══════════════════════════════════════════════
 
-def find_best_action(
+def find_best_trade(
     state: CatanState,
-    color: int,
-    evaluator: StateEvaluator,
-    iterations: int = 800,
+    perspective_color: int,
+    hand_tracker: HandTracker,
+    acceptance_model: Optional[TradeAcceptanceModel] = None,
+    proposal_policy: Optional[TradeProposalPolicy] = None,
+    iterations: int = 1000,
     time_limit: Optional[float] = None,
-    opponent_rounds: int = 1,
-    exploration_constant: float = 1.4,
-    dev_card_played_this_turn: bool = False,
     verbose: bool = False,
-) -> Action:
+) -> Optional[Trade]:
     """
-    Find the best main-phase action for `color` and return it.
+    One-call interface to find the best trade for a player.
 
-    Call apply_action(state, action, color) to get the next state, then call
-    this again for the next action decision.  Repeat until PassTurn is returned.
+    Args:
+        state: Current game state
+        perspective_color: The player considering a trade
+        hand_tracker: Belief state tracker for opponent hands
+        acceptance_model: Trained acceptance classifier (optional)
+        proposal_policy: Trained proposal policy (optional)
+        iterations: Number of MCTS iterations
+        time_limit: Max seconds to search (optional)
+        verbose: Print analysis
 
-    Parameters
-    ----------
-    iterations : int
-        Number of MCTS iterations.  800 balances speed and accuracy for
-        real-time play.  Use 1500+ for stronger offline analysis.
-    opponent_rounds : int
-        Rounds of greedy opponent simulation in each leaf evaluation.
-        1 is the recommended default (full 2-ply equivalent without tree bloat).
-        Set to 0 to revert to fast one-ply if latency is critical.
-    time_limit : float | None
-        Hard wall-clock cap in seconds (overrides iterations if hit first).
+    Returns:
+        Best Trade object, or None if no trade is recommended.
     """
-    mcts = CatanMCTS(
+    mcts = TradeMCTS(
         state=state,
-        color=color,
-        evaluator=evaluator,
-        exploration_constant=exploration_constant,
-        opponent_rounds=opponent_rounds,
-        dev_card_played_this_turn=dev_card_played_this_turn,
+        perspective_color=perspective_color,
+        hand_tracker=hand_tracker,
+        acceptance_model=acceptance_model,
+        proposal_policy=proposal_policy,
     )
+
     best = mcts.search(iterations=iterations, time_limit=time_limit)
+
     if verbose:
         mcts.print_analysis()
+
     return best
-
-
-# ─── Self-test ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import glob
-    import os
-    import sys
-
-    DATASET_DIR = os.environ.get("CATAN_DATASET_DIR", "./dataset")
-    files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.json")))
-    if not files:
-        print(f"No JSON files found in {DATASET_DIR}")
-        sys.exit(1)
-
-    from data.replay import GameReplay
-    from mcts.actions import PlayKnight, PlayMonopoly, PlayRoadBuilding, PlayYearOfPlenty
-
-    replay = GameReplay.from_file(files[0])
-    print(f"Loaded game: {os.path.basename(files[0])}")
-    print(f"Players: {replay.play_order}")
-
-    ckpt = "checkpoints/best.pt"
-    ev = StateEvaluator(ckpt if os.path.exists(ckpt) else None)
-
-    errors = 0
-
-    # ── Main search tests ────────────────────────────────────────────────────
-    for turn in [15, 25, 40]:
-        state = replay.replay_to_turn(turn)
-        color = state.current_player_color
-        print(f"\n── Turn {turn} | Player {color} ──")
-        print(state.summary())
-
-        t0 = time.time()
-        mcts = CatanMCTS(state=state, color=color, evaluator=ev, opponent_rounds=1)
-        best = mcts.search(iterations=500)
-        elapsed = time.time() - t0
-
-        mcts.print_analysis(top_n=6)
-        print(f"  Search time: {elapsed:.2f}s for 500 iters (opponent_rounds=1)")
-
-        if best is None:
-            print("  ERROR: got None action")
-            errors += 1
-            continue
-
-        new_state = apply_action(state, best, color)
-        for c, p in new_state.players.items():
-            if p.total_resources < 0:
-                print(f"  ERROR: negative resources for player {c} after {best}")
-                errors += 1
-
-    # ── Demonstrate opponent_rounds effect on Turn 25 Monopoly decision ──────
-    print("\n── Monopoly sensitivity: opponent_rounds=0 vs 1 (Turn 25) ──")
-    state25 = replay.replay_to_turn(25)
-    color25 = state25.current_player_color
-    print(f"Player {color25} | "
-          f"resources: {dict(state25.players[color25].resource_counts)} | "
-          f"dev cards: {state25.players[color25].dev_cards}")
-
-    for rounds in [0, 1]:
-        mcts = CatanMCTS(
-            state=state25, color=color25, evaluator=ev, opponent_rounds=rounds
-        )
-        mcts.search(iterations=500)
-        stats = mcts.get_action_stats()
-        best_stat = stats[0]
-        print(f"  opp_rounds={rounds}: best={best_stat['action']} "
-              f"(Q={best_stat['q_value']:.4f}, visits={best_stat['visits']})")
-
-    # ── Full turn simulation ─────────────────────────────────────────────────
-    print("\n── Full turn simulation (find_best_action loop, Turn 25) ──")
-    state = replay.replay_to_turn(25)
-    color = state.current_player_color
-    print(f"Player {color} | resources: {dict(state.players[color].resource_counts)}")
-
-    dev_played = False
-    step = 0
-    while step < 10:
-        action = find_best_action(
-            state, color, ev,
-            iterations=500,
-            opponent_rounds=1,
-            dev_card_played_this_turn=dev_played,
-        )
-        print(f"  Step {step+1}: {action}")
-        if isinstance(action, PassTurn):
-            break
-        if isinstance(action, (PlayKnight, PlayMonopoly, PlayRoadBuilding, PlayYearOfPlenty)):
-            dev_played = True
-        state = apply_action(state, action, color)
-        step += 1
-    print(f"  Turn ended after {step} action(s)")
-
-    if errors == 0:
-        print("\nAll search tests passed.")
-    else:
-        print(f"\n{errors} error(s) found.")
-        sys.exit(1)
